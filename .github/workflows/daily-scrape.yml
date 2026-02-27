@@ -33,8 +33,7 @@ jobs:
 
       - name: 运行采集脚本
         env:
-          BAIDU_OCR_API_KEY: ${{ secrets.BAIDU_OCR_API_KEY }}
-          BAIDU_OCR_SECRET_KEY: ${{ secrets.BAIDU_OCR_SECRET_KEY }}
+          MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
         run: |
           cd scraper
           python scrape.py

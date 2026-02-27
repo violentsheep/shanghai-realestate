@@ -1,23 +1,21 @@
 #!/usr/bin/env python3
 """
 上海房地产数据采集脚本
-策略：Playwright 无头浏览器截图 → 百度OCR 文字识别 → 正则提取数字
+策略：Playwright 无头浏览器渲染页面 → 提取页面文本 → MiniMax 文本模型解析数字
 数据源：网上房地产 fangdi.com.cn（上海市房地产交易中心，政府机构）
 合规说明：
   - 只访问公开页面，无需登录
   - robots.txt 不存在（404），无限制规则
-  - 截图方式，非结构化爬虫，不绕过任何反爬机制
-  - 每次请求间隔 ≥5 秒
+  - 渲染后提取文本，不绕过任何反爬机制
+  - 每次请求间隔 ≥6 秒
   - 只采集必要字段
 """
 
 import asyncio
-import base64
 import json
 import os
 import re
 import sys
-import urllib.parse
 import urllib.request
 from datetime import date, datetime
 from pathlib import Path
@@ -29,8 +27,8 @@ DATA_DIR = Path(__file__).parent.parent / "data" / "history"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 HISTORY_FILE = DATA_DIR / "data.json"
 
-BAIDU_API_KEY    = os.environ.get("BAIDU_OCR_API_KEY", "")
-BAIDU_SECRET_KEY = os.environ.get("BAIDU_OCR_SECRET_KEY", "")
+MINIMAX_API_KEY = os.environ.get("MINIMAX_API_KEY", "")
+MINIMAX_API_URL = "https://api.minimaxi.com/anthropic/v1/messages"
 
 BROWSER_HEADERS = {
     "User-Agent": (
@@ -46,43 +44,10 @@ URLS = {
     "trade":       "https://www.fangdi.com.cn/trade/trade.html",
 }
 
-# ─── 百度 OCR ─────────────────────────────────────────────────────────────────
-def get_baidu_token() -> str:
-    """用 API Key + Secret Key 换取 access_token（有效期30天）"""
-    url = (
-        f"https://aip.baidubce.com/oauth/2.0/token"
-        f"?grant_type=client_credentials"
-        f"&client_id={BAIDU_API_KEY}"
-        f"&client_secret={BAIDU_SECRET_KEY}"
-    )
-    with urllib.request.urlopen(url, timeout=10) as resp:
-        data = json.loads(resp.read())
-    return data["access_token"]
 
-
-def baidu_ocr(img_bytes: bytes, token: str) -> str:
-    """调用百度通用文字识别，返回所有识别行拼接成的纯文本"""
-    url = f"https://aip.baidubce.com/rest/2.0/ocr/v1/general_basic?access_token={token}"
-    b64 = base64.b64encode(img_bytes).decode()
-    body = urllib.parse.urlencode({"image": b64}).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=body,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-    )
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        result = json.loads(resp.read())
-
-    if "error_code" in result:
-        raise RuntimeError(f"百度OCR错误: {result}")
-
-    lines = [item["words"] for item in result.get("words_result", [])]
-    return "\n".join(lines)
-
-
-# ─── Playwright 截图 ──────────────────────────────────────────────────────────
-async def screenshot_page(url: str, wait_ms: int = 4000) -> bytes:
-    """Playwright 渲染页面并全页截图"""
+# ─── Playwright 提取页面文本 ──────────────────────────────────────────────────
+async def get_page_text(url: str, wait_ms: int = 5000) -> str:
+    """Playwright 完整渲染页面，返回可见文本内容"""
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
@@ -96,93 +61,96 @@ async def screenshot_page(url: str, wait_ms: int = 4000) -> bytes:
         page = await ctx.new_page()
         await page.goto(url, wait_until="networkidle", timeout=45000)
         await page.wait_for_timeout(wait_ms)
-        img = await page.screenshot(full_page=True)
+        # 提取页面全部可见文本
+        text = await page.inner_text("body")
         await browser.close()
-    return img
+    return text
 
 
-# ─── 数字解析 ─────────────────────────────────────────────────────────────────
-def parse_second_hand(text: str) -> dict:
-    """从OCR文本中提取二手房昨日成交套数和面积"""
-    units, area = None, None
+# ─── MiniMax 文本解析 ─────────────────────────────────────────────────────────
+def ask_minimax(prompt: str) -> str:
+    """调用 MiniMax（Anthropic 兼容接口）解析文本，返回回复内容"""
+    payload = json.dumps({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 300,
+        "messages": [{"role": "user", "content": prompt}]
+    }).encode("utf-8")
 
-    # 套数：匹配 "昨日二手房成交套数: 527套" 或 "成交套数527"
-    m = re.search(r'昨日二手房成交套数[：:\s]*(\d[\d,]*)\s*套?', text)
-    if not m:
-        # 宽松匹配：找"套数"后面跟的数字
-        m = re.search(r'套数[：:\s]*(\d[\d,]*)', text)
+    req = urllib.request.Request(
+        MINIMAX_API_URL,
+        data=payload,
+        headers={
+            "x-api-key": MINIMAX_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        d = json.loads(resp.read())
+
+    for c in d.get("content", []):
+        if c.get("type") == "text":
+            return c["text"].strip()
+    raise RuntimeError(f"MiniMax 无文本回复: {d}")
+
+
+def parse_json_reply(raw: str) -> dict:
+    """从模型回复中提取 JSON"""
+    text = re.sub(r"```json\s*|\s*```", "", raw).strip()
+    m = re.search(r"\{.*\}", text, re.DOTALL)
     if m:
-        units = int(m.group(1).replace(",", ""))
-
-    # 面积：匹配 "昨日二手房成交面积: 42244.63㎡"
-    m = re.search(r'昨日二手房成交面积[：:\s]*([\d,]+\.?\d*)\s*[㎡平方]?', text)
-    if not m:
-        m = re.search(r'成交面积[：:\s]*([\d,]+\.?\d*)', text)
-    if m:
-        area = float(m.group(1).replace(",", ""))
-
-    return {"units": units, "area": area}
-
-
-def parse_trade(text: str) -> dict:
-    """从OCR文本中提取一手房今日成交 + 二手房挂牌数量"""
-    nh_units, nh_area, listing = None, None, None
-
-    # 一手房今日成交套数
-    # 页面文本类似："今日成交 230套 面积12345㎡"
-    m = re.search(r'今日[共预出售]*各类商品房\s*(\d[\d,]*)\s*套', text)
-    if not m:
-        m = re.search(r'今日成交.*?(\d[\d,]+)\s*套', text)
-    if m:
-        nh_units = int(m.group(1).replace(",", ""))
-
-    # 一手房今日成交面积（㎡）
-    m = re.search(r'面积\s*([\d,]+\.?\d*)\s*平方米', text)
-    if not m:
-        m = re.search(r'今日.*?面积.*?([\d,]+\.?\d*)', text)
-    if m:
-        val = float(m.group(1).replace(",", ""))
-        # 如果是万㎡单位转换
-        nh_area = val * 10000 if val < 1000 else val
-
-    # 二手房挂牌总套数：找最大的挂牌数字
-    # 页面列各区套数，我们找合计或所有数字加总
-    listing_nums = re.findall(r'(\d{4,6})\s*套', text)
-    if listing_nums:
-        nums = [int(n) for n in listing_nums]
-        # 挂牌数一般是最大的那个，或者取最后出现的合计
-        listing = max(nums)
-
-    return {"new_house_units": nh_units, "new_house_area": nh_area, "listing_total": listing}
+        return json.loads(m.group())
+    return json.loads(text)
 
 
 # ─── 采集任务 ─────────────────────────────────────────────────────────────────
-async def fetch_second_hand(token: str, debug_dir: Path) -> dict:
-    print("  📸 截图：二手房页面...")
-    img = await screenshot_page(URLS["second_hand"])
-    (debug_dir / f"second_hand_{date.today()}.png").write_bytes(img)
-
-    print("  🔍 OCR 识别...")
-    text = baidu_ocr(img, token)
+async def fetch_second_hand(debug_dir: Path) -> dict:
+    print("  🌐 渲染二手房页面...")
+    text = await get_page_text(URLS["second_hand"])
     (debug_dir / f"second_hand_{date.today()}.txt").write_text(text, encoding="utf-8")
-    print(f"     OCR文本片段: {text[:200]!r}")
+    print(f"     页面文本长度: {len(text)} 字符")
 
-    result = parse_second_hand(text)
-    print(f"  ✅ 二手房: {result}")
+    prompt = f"""下面是上海网上房地产（fangdi.com.cn）二手房页面的文本内容。
+请从中找到"昨日成交量"相关的数字，提取：
+1. 昨日二手房成交套数（整数）
+2. 昨日二手房成交面积（浮点数，单位㎡）
+
+只返回JSON，格式：
+{{"units": <套数整数>, "area": <面积浮点数>}}
+
+若某项找不到填null。不要任何解释。
+
+页面文本：
+{text[:3000]}"""
+
+    raw = ask_minimax(prompt)
+    result = parse_json_reply(raw)
+    print(f"  ✅ 二手房成交: {result}")
     return result
 
 
-async def fetch_trade(token: str, debug_dir: Path) -> dict:
-    print("  📸 截图：交易统计页面...")
-    img = await screenshot_page(URLS["trade"])
-    (debug_dir / f"trade_{date.today()}.png").write_bytes(img)
-
-    print("  🔍 OCR 识别...")
-    text = baidu_ocr(img, token)
+async def fetch_trade(debug_dir: Path) -> dict:
+    print("  🌐 渲染交易统计页面...")
+    text = await get_page_text(URLS["trade"])
     (debug_dir / f"trade_{date.today()}.txt").write_text(text, encoding="utf-8")
-    print(f"     OCR文本片段: {text[:200]!r}")
+    print(f"     页面文本长度: {len(text)} 字符")
 
-    result = parse_trade(text)
+    prompt = f"""下面是上海网上房地产（fangdi.com.cn）交易统计页面的文本内容。
+请提取以下两项数据：
+1. 一手房今日成交住宅套数（全市合计，整数）
+2. 一手房今日成交住宅面积（全市合计，浮点数，单位㎡，若是万㎡请乘以10000）
+3. 二手房出售挂牌总套数（各区加总，整数）
+
+只返回JSON，格式：
+{{"new_house_units": <套数>, "new_house_area": <面积㎡>, "listing_total": <挂牌套数>}}
+
+若某项找不到填null。不要任何解释。
+
+页面文本：
+{text[:4000]}"""
+
+    raw = ask_minimax(prompt)
+    result = parse_json_reply(raw)
     print(f"  ✅ 交易统计: {result}")
     return result
 
@@ -216,45 +184,30 @@ async def main():
     print(f"\n🏠 上海房地产数据采集 [{today}]")
     print("─" * 45)
 
-    if not BAIDU_API_KEY or not BAIDU_SECRET_KEY:
-        print("❌ 请设置环境变量 BAIDU_OCR_API_KEY 和 BAIDU_OCR_SECRET_KEY")
+    if not MINIMAX_API_KEY:
+        print("❌ 请设置环境变量 MINIMAX_API_KEY")
         sys.exit(1)
 
     history = load_history()
-
     if any(r["date"] == today for r in history) and "--force" not in sys.argv:
-        print(f"⚠️  今日数据已存在，跳过（加 --force 强制重采）")
+        print("⚠️  今日数据已存在，跳过（加 --force 强制重采）")
         return
 
     debug_dir = DATA_DIR / "debug"
     debug_dir.mkdir(exist_ok=True)
 
-    # 获取百度 token（缓存到文件，30天有效）
-    token_cache = DATA_DIR / ".baidu_token"
-    if token_cache.exists():
-        token = token_cache.read_text().strip()
-        print("  🔑 使用缓存 Token")
-    else:
-        print("  🔑 获取百度 OCR Token...")
-        token = get_baidu_token()
-        token_cache.write_text(token)
-
     sh, trade = {}, {}
 
     try:
-        sh = await fetch_second_hand(token, debug_dir)
+        sh = await fetch_second_hand(debug_dir)
     except Exception as e:
         print(f"  ❌ 二手房采集失败: {e}")
-        # token 可能过期，重新获取
-        if "111" in str(e) or "token" in str(e).lower():
-            token = get_baidu_token()
-            token_cache.write_text(token)
 
     print("  ⏳ 等待 6 秒（合规间隔）...")
     await asyncio.sleep(6)
 
     try:
-        trade = await fetch_trade(token, debug_dir)
+        trade = await fetch_trade(debug_dir)
     except Exception as e:
         print(f"  ❌ 交易统计采集失败: {e}")
 
