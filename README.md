@@ -58,13 +58,24 @@ Vercel 自动部署
     └── daily-scrape.yml   # 每日自动运行
 ```
 
-## 部署到自己的 GitHub + Vercel
+## 部署到自己的 GitHub
 
 1. Fork 此仓库
-2. 在 GitHub Secrets 中添加：
-   - `GEMINI_API_KEY`：Google Gemini API 密钥（免费额度足够）
-   - `VERCEL_TOKEN`：Vercel 访问令牌
-   - `VERCEL_ORG_ID`：Vercel 组织 ID
-   - `VERCEL_PROJECT_ID`：Vercel 项目 ID
-3. 手动触发 `daily-scrape` workflow 验证一次
-4. 之后每天 08:00 自动运行
+2. 申请百度 OCR API：https://console.bce.baidu.com/ai/#/ai/ocr/overview/index
+   - 创建应用后获得 API Key 和 Secret Key
+   - 通用文字识别（标准版）每天 **500次免费**，完全够用
+3. 在 GitHub Secrets 中添加（仓库 Settings → Secrets → Actions）：
+   - `BAIDU_OCR_API_KEY`：百度应用的 API Key
+   - `BAIDU_OCR_SECRET_KEY`：百度应用的 Secret Key
+4. 开启 GitHub Pages：Settings → Pages → Source 选 `gh-pages` 分支
+5. 手动触发一次 workflow 验证：Actions → 每日采集 → Run workflow
+6. 之后每天 08:30 自动运行
+
+## OCR 方案说明
+
+截图采集策略（合规）：
+- GitHub Actions 在境外服务器运行，可正常渲染 fangdi.com.cn
+- Playwright 启动无头 Chromium 截取完整页面截图
+- 截图发送给百度 OCR（通用文字识别）提取文字
+- 正则表达式从文字中解析套数、面积等数字
+- 每次请求间隔 ≥6 秒
