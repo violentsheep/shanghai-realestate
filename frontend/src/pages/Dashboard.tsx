@@ -18,8 +18,13 @@ export default function Dashboard() {
 
   if (!latest) {
     return (
-      <div className="min-h-screen flex items-center justify-center text-gray-400">
-        暂无数据
+      <div className="min-h-screen bg-gray-50 flex flex-col items-center justify-center gap-4">
+        <div className="w-12 h-12 rounded-2xl bg-gradient-to-br from-blue-500 to-violet-600 flex items-center justify-center">
+          <Building2 size={24} className="text-white" />
+        </div>
+        <h1 className="text-lg font-bold text-gray-700">上海楼市数据</h1>
+        <p className="text-sm text-gray-400">数据采集中，今日数据将于 08:30 后更新</p>
+        <p className="text-xs text-gray-300">数据来源：上海市房地产交易中心</p>
       </div>
     );
   }
