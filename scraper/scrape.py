@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
 上海房地产数据采集脚本
-策略：Playwright 截图 → Gemini Vision OCR 解析数字
-数据源：网上房地产 fangdi.com.cn（上海市房地产交易中心）
-robots.txt：不存在（404），无限制规则
-采集频率：每次请求间隔 5 秒，合规操作
+策略：Playwright 无头浏览器截图 → MiniMax Vision API 解析数字
+数据源：网上房地产 fangdi.com.cn（上海市房地产交易中心，政府机构）
+合规说明：
+  - 只访问公开页面，无需登录
+  - robots.txt 不存在（404），无限制规则
+  - 截图方式，非结构化爬虫，不绕过任何反爬机制
+  - 每次请求间隔 ≥5 秒
+  - 只采集必要字段
 """
 
 import asyncio
@@ -13,8 +17,7 @@ import json
 import os
 import re
 import sys
-import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from pathlib import Path
 
 import httpx
@@ -25,181 +28,155 @@ DATA_DIR = Path(__file__).parent.parent / "data" / "history"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 HISTORY_FILE = DATA_DIR / "data.json"
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+MINIMAX_API_KEY    = os.environ.get("MINIMAX_API_KEY", "")
+MINIMAX_GROUP_ID   = os.environ.get("MINIMAX_GROUP_ID", "")
+MINIMAX_URL        = f"https://api.minimax.chat/v1/text/chatcompletion_v2"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/122.0.0.0 Safari/537.36",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0.0.0 Safari/537.36"
+    ),
     "Accept-Language": "zh-CN,zh;q=0.9",
 }
 
 URLS = {
     "second_hand": "https://www.fangdi.com.cn/old_house/old_house.html",
-    "new_house":   "https://www.fangdi.com.cn/trade/trade.html",
-    "listing":     "https://www.fangdi.com.cn/trade/trade.html",
+    "trade":       "https://www.fangdi.com.cn/trade/trade.html",
 }
 
-# ─── 截图函数 ─────────────────────────────────────────────────────────────────
-async def screenshot_page(url: str, selector: str = None, wait_ms: int = 3000) -> bytes:
-    """用 Playwright 截图，返回 PNG bytes"""
+# ─── 截图 ────────────────────────────────────────────────────────────────────
+async def screenshot_page(url: str, wait_ms: int = 4000) -> bytes:
+    """Playwright 渲染页面并截图，返回 PNG bytes"""
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"]
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
         )
-        page = await browser.new_page(
+        ctx = await browser.new_context(
             extra_http_headers=HEADERS,
-            viewport={"width": 1280, "height": 900}
+            viewport={"width": 1280, "height": 900},
+            locale="zh-CN",
         )
-        await page.goto(url, wait_until="networkidle", timeout=30000)
+        page = await ctx.new_page()
+        await page.goto(url, wait_until="networkidle", timeout=45000)
         await page.wait_for_timeout(wait_ms)
-
-        if selector:
-            element = await page.query_selector(selector)
-            if element:
-                img_bytes = await element.screenshot()
-            else:
-                img_bytes = await page.screenshot(full_page=True)
-        else:
-            img_bytes = await page.screenshot(full_page=True)
-
+        img_bytes = await page.screenshot(full_page=True)
         await browser.close()
-        return img_bytes
+    return img_bytes
 
 
-# ─── Gemini Vision OCR ────────────────────────────────────────────────────────
-async def ocr_with_gemini(img_bytes: bytes, prompt: str) -> dict:
-    """将截图发给 Gemini Vision，返回解析后的 JSON"""
-    if not GEMINI_API_KEY:
-        raise ValueError("GEMINI_API_KEY 环境变量未设置")
+# ─── MiniMax Vision OCR ───────────────────────────────────────────────────────
+async def ask_minimax_vision(img_bytes: bytes, prompt: str) -> str:
+    """把截图发给 MiniMax VL 模型，返回原始文本"""
+    if not MINIMAX_API_KEY:
+        raise ValueError("MINIMAX_API_KEY 未设置")
 
     b64 = base64.b64encode(img_bytes).decode()
     payload = {
-        "contents": [{
-            "parts": [
-                {"text": prompt},
-                {"inline_data": {"mime_type": "image/png", "data": b64}}
-            ]
-        }],
-        "generationConfig": {
-            "temperature": 0,
-            "response_mime_type": "application/json"
-        }
+        "model": "MiniMax-VL-01",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{b64}"
+                        }
+                    },
+                    {
+                        "type": "text",
+                        "text": prompt
+                    }
+                ]
+            }
+        ],
+        "temperature": 0.01,
+        "max_tokens": 512,
     }
+
+    headers = {
+        "Authorization": f"Bearer {MINIMAX_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    if MINIMAX_GROUP_ID:
+        params = {"GroupId": MINIMAX_GROUP_ID}
+    else:
+        params = {}
 
     async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.post(
-            f"{GEMINI_URL}?key={GEMINI_API_KEY}",
+            MINIMAX_URL,
             json=payload,
-            headers={"Content-Type": "application/json"}
+            headers=headers,
+            params=params,
         )
         resp.raise_for_status()
         result = resp.json()
 
-    text = result["candidates"][0]["content"]["parts"][0]["text"]
-    # 清理可能的 markdown code fence
-    text = re.sub(r"```json\s*|\s*```", "", text).strip()
+    return result["choices"][0]["message"]["content"]
+
+
+async def parse_json_from_vision(img_bytes: bytes, prompt: str) -> dict:
+    """Vision 结果解析为 JSON dict"""
+    raw = await ask_minimax_vision(img_bytes, prompt)
+    # 清理 markdown 代码块
+    text = re.sub(r"```json\s*|\s*```", "", raw).strip()
+    # 提取第一个 {...}
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if m:
+        return json.loads(m.group())
     return json.loads(text)
 
 
-# ─── 各数据采集任务 ───────────────────────────────────────────────────────────
-async def fetch_second_hand() -> dict:
-    """采集二手房昨日成交数据"""
-    print("📸 截图：二手房成交页面...")
-    img = await screenshot_page(
-        URLS["second_hand"],
-        wait_ms=3000
+# ─── 采集任务 ─────────────────────────────────────────────────────────────────
+async def fetch_second_hand(debug_dir: Path) -> dict:
+    """二手房：昨日成交套数、面积"""
+    print("  📸 截图二手房页面...")
+    img = await screenshot_page(URLS["second_hand"])
+    (debug_dir / f"second_hand_{date.today()}.png").write_bytes(img)
+
+    prompt = (
+        "这是上海网上房地产（fangdi.com.cn）二手房页面的截图。"
+        "请找到页面中'昨日成交量'区域，提取以下数字，以JSON返回：\n"
+        '{"units": <昨日二手房成交套数，整数>, '
+        '"area": <昨日二手房成交面积，浮点数，单位㎡>}\n'
+        "注意：套数是纯整数（如527），面积是带小数的㎡数值（如42244.63）。"
+        "若无法读取填null。只返回JSON，不要其他内容。"
     )
-
-    # 保存截图供调试
-    debug_path = DATA_DIR / f"debug_second_hand_{date.today()}.png"
-    debug_path.write_bytes(img)
-
-    prompt = """
-请仔细阅读这张上海网上房地产（fangdi.com.cn）二手房页面截图。
-找到页面中"昨日成交量"区域的数字，提取以下信息并以JSON格式返回：
-
-{
-  "units": <昨日二手房成交套数，整数>,
-  "area": <昨日二手房成交面积，浮点数，单位平方米>
-}
-
-注意：
-- 套数是整数（例如527）
-- 面积单位是平方米（㎡），是一个带小数的数字（例如42244.63）
-- 如果数据无法读取，对应字段填 null
-"""
-    result = await ocr_with_gemini(img, prompt)
-    print(f"  ✅ 二手房成交：{result}")
+    result = await parse_json_from_vision(img, prompt)
+    print(f"    ✅ 二手房成交: {result}")
     return result
 
 
-async def fetch_new_house() -> dict:
-    """采集一手房今日成交数据（住宅汇总）"""
-    print("📸 截图：一手房/交易统计页面...")
-    img = await screenshot_page(
-        URLS["new_house"],
-        wait_ms=3000
+async def fetch_trade(debug_dir: Path) -> dict:
+    """交易统计页：一手房今日成交 + 二手房挂牌数量"""
+    print("  📸 截图交易统计页面...")
+    img = await screenshot_page(URLS["trade"])
+    (debug_dir / f"trade_{date.today()}.png").write_bytes(img)
+
+    prompt = (
+        "这是上海网上房地产（fangdi.com.cn）交易统计页面的截图。\n"
+        "请提取以下两组数据，以JSON返回：\n"
+        "1. 一手房今日成交住宅（普通住宅）：全市合计今日成交套数和面积\n"
+        "2. 各区二手房出售挂牌总套数（所有区加总，或直接读合计行）\n"
+        "返回格式：\n"
+        '{"new_house_units": <今日一手房住宅成交套数，整数>, '
+        '"new_house_area": <今日一手房住宅成交面积，平方米，浮点数>, '
+        '"listing_total": <二手房出售挂牌总套数，整数>}\n'
+        "面积若显示为万㎡请乘以10000转换为㎡。若无法读取填null。只返回JSON。"
     )
-
-    debug_path = DATA_DIR / f"debug_new_house_{date.today()}.png"
-    debug_path.write_bytes(img)
-
-    prompt = """
-请仔细阅读这张上海网上房地产（fangdi.com.cn）交易统计页面截图。
-找到"一手房各区成交统计"或"今日成交"区域，提取住宅类（普通住宅）的全市合计今日成交数据：
-
-{
-  "units": <今日一手房住宅成交总套数，整数，全市所有区域汇总>,
-  "area": <今日一手房住宅成交总面积，浮点数，单位平方米>
-}
-
-注意：
-- 需要汇总所有区域（内环、中环、外环、郊环）的今日成交数字
-- 面积可能显示为万平方米，请换算为平方米（× 10000）
-- 如果数据无法读取或页面显示为0，照实返回
-- 如果无法确定，填 null
-"""
-    result = await ocr_with_gemini(img, prompt)
-    print(f"  ✅ 一手房成交：{result}")
+    result = await parse_json_from_vision(img, prompt)
+    print(f"    ✅ 交易统计: {result}")
     return result
 
 
-async def fetch_listing() -> dict:
-    """采集二手房挂牌数量"""
-    print("📸 截图：二手房挂牌页面...")
-    img = await screenshot_page(
-        URLS["listing"],
-        wait_ms=3000
-    )
-    # 复用 new_house 截图（同一个页面）
-    debug_path = DATA_DIR / f"debug_listing_{date.today()}.png"
-    debug_path.write_bytes(img)
-
-    prompt = """
-请仔细阅读这张上海网上房地产（fangdi.com.cn）交易统计页面截图。
-找到"各区二手房出售挂牌排行"区域，提取全市出售挂牌总套数：
-
-{
-  "total_listing": <全市二手房出售挂牌总套数，整数，各区套数之和>
-}
-
-注意：
-- 需要将所有区域（黄浦、徐汇、长宁、静安、普陀、虹口、杨浦、浦东、宝山、闵行、嘉定、松江、青浦、奉贤、崇明等）的挂牌套数加总
-- 如果有"合计"行，直接取合计数字
-- 如果数据无法读取，填 null
-"""
-    result = await ocr_with_gemini(img, prompt)
-    print(f"  ✅ 二手房挂牌：{result}")
-    return result
-
-
-# ─── 数据持久化 ───────────────────────────────────────────────────────────────
+# ─── 数据存储 ─────────────────────────────────────────────────────────────────
 def load_history() -> list:
     if HISTORY_FILE.exists():
-        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+        with open(HISTORY_FILE, encoding="utf-8") as f:
             return json.load(f)
     return []
 
@@ -209,88 +186,78 @@ def save_history(records: list):
         json.dump(records, f, ensure_ascii=False, indent=2)
 
 
-def compute_avg_area(units, area):
-    """计算套均面积"""
-    if units and area and units > 0:
-        return round(area / units, 2)
+def avg_area(units, area):
+    try:
+        if units and area and float(units) > 0:
+            return round(float(area) / float(units), 2)
+    except Exception:
+        pass
     return None
 
 
 # ─── 主流程 ───────────────────────────────────────────────────────────────────
 async def main():
     today = date.today().isoformat()
-    print(f"\n🏠 上海房地产数据采集 — {today}\n{'─'*40}")
+    print(f"\n🏠 上海房地产数据采集 [{today}]")
+    print("─" * 45)
 
     history = load_history()
 
-    # 检查今日数据是否已采集
-    existing = next((r for r in history if r["date"] == today), None)
-    if existing and "--force" not in sys.argv:
-        print(f"⚠️  今日({today})数据已存在，跳过。使用 --force 强制重采集。")
+    if any(r["date"] == today for r in history) and "--force" not in sys.argv:
+        print(f"⚠️  今日数据已存在，跳过（--force 可强制重采）")
         return
 
-    # 注意：fangdi.com.cn 二手房数据显示的是"昨日"成交
-    # 所以我们记录 date = today，但标注数据对应的是 yesterday
-    data_date = today  # 记录采集日期
+    debug_dir = DATA_DIR / "debug"
+    debug_dir.mkdir(exist_ok=True)
 
-    # 采集各数据（间隔5秒，合规）
-    second_hand = {}
-    new_house = {}
-    listing = {}
+    sh, trade = {}, {}
 
     try:
-        second_hand = await fetch_second_hand()
+        sh = await fetch_second_hand(debug_dir)
     except Exception as e:
         print(f"  ❌ 二手房采集失败: {e}")
 
-    await asyncio.sleep(5)  # 合规间隔
+    print("  ⏳ 等待 6 秒...")
+    await asyncio.sleep(6)
 
     try:
-        new_house = await fetch_new_house()
+        trade = await fetch_trade(debug_dir)
     except Exception as e:
-        print(f"  ❌ 一手房采集失败: {e}")
+        print(f"  ❌ 交易统计采集失败: {e}")
 
-    await asyncio.sleep(5)  # 复用同一截图，跳过再次请求
-
-    try:
-        listing = await fetch_listing()
-    except Exception as e:
-        print(f"  ❌ 挂牌数据采集失败: {e}")
-
-    # 组装记录
-    sh_units = second_hand.get("units")
-    sh_area = second_hand.get("area")
-    nh_units = new_house.get("units")
-    nh_area = new_house.get("area")
+    sh_u = sh.get("units")
+    sh_a = sh.get("area")
+    nh_u = trade.get("new_house_units")
+    nh_a = trade.get("new_house_area")
+    li_t = trade.get("listing_total")
 
     record = {
-        "date": data_date,
-        "scraped_at": datetime.now().isoformat(),
+        "date": today,
+        "scraped_at": datetime.now().isoformat(timespec="seconds"),
         "second_hand": {
-            "units": sh_units,
-            "area": sh_area,
-            "avg_area": compute_avg_area(sh_units, sh_area),
-            "note": "昨日网签成交（T+1）"
+            "units":    sh_u,
+            "area":     sh_a,
+            "avg_area": avg_area(sh_u, sh_a),
+            "note":     "昨日网签成交（T+1）"
         },
         "new_house": {
-            "units": nh_units,
-            "area": nh_area,
-            "avg_area": compute_avg_area(nh_units, nh_area),
-            "note": "今日成交（当日累计）"
+            "units":    nh_u,
+            "area":     nh_a,
+            "avg_area": avg_area(nh_u, nh_a),
+            "note":     "今日成交（当日累计）"
         },
         "listing": {
-            "total": listing.get("total_listing"),
-            "note": "二手房出售挂牌套数"
+            "total": li_t,
+            "note":  "二手房出售挂牌套数"
         }
     }
 
-    # 更新历史（如已存在则替换）
-    history = [r for r in history if r["date"] != data_date]
+    history = [r for r in history if r["date"] != today]
     history.append(record)
     history.sort(key=lambda x: x["date"])
-
     save_history(history)
-    print(f"\n✅ 数据已保存至 {HISTORY_FILE}")
+
+    print(f"\n✅ 已保存 → {HISTORY_FILE}")
     print(json.dumps(record, ensure_ascii=False, indent=2))
 
 
