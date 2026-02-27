@@ -1,0 +1,84 @@
+name: 每日采集上海房地产数据
+
+on:
+  schedule:
+    # 每天北京时间 08:00 运行（UTC 00:00）
+    - cron: '0 0 * * *'
+  workflow_dispatch:  # 支持手动触发
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # 允许提交数据文件
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: |
+          cd scraper
+          pip install -r requirements.txt
+          playwright install chromium --with-deps
+
+      - name: 运行采集脚本
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          cd scraper
+          python scrape.py
+
+      - name: 提交数据更新
+        run: |
+          git config --local user.email "bot@github.com"
+          git config --local user.name "Data Bot"
+          git add data/
+          git diff --staged --quiet || git commit -m "📊 数据更新: $(date '+%Y-%m-%d')"
+          git push
+
+  deploy:
+    needs: scrape
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+        with:
+          ref: main  # 确保拿到最新提交（含数据）
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 安装 pnpm
+        uses: pnpm/action-setup@v3
+        with:
+          version: 9
+
+      - name: 安装前端依赖
+        run: |
+          cd frontend
+          pnpm install
+
+      - name: 构建前端
+        run: |
+          cd frontend
+          pnpm build
+
+      - name: 部署到 Vercel
+        uses: amondnet/vercel-action@v25
+        with:
+          vercel-token: ${{ secrets.VERCEL_TOKEN }}
+          vercel-org-id: ${{ secrets.VERCEL_ORG_ID }}
+          vercel-project-id: ${{ secrets.VERCEL_PROJECT_ID }}
+          working-directory: frontend
+          vercel-args: '--prod'
