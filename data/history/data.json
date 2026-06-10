@@ -2058,5 +2058,25 @@
       "total": null,
       "note": "二手房出售挂牌套数"
     }
+  },
+  {
+    "date": "2026-06-10",
+    "scraped_at": "2026-06-10T04:58:21",
+    "second_hand": {
+      "units": null,
+      "area": null,
+      "avg_area": null,
+      "note": "昨日网签成交（T+1）"
+    },
+    "new_house": {
+      "units": null,
+      "area": null,
+      "avg_area": null,
+      "note": "今日成交（当日累计）"
+    },
+    "listing": {
+      "total": null,
+      "note": "二手房出售挂牌套数"
+    }
   }
 ]
